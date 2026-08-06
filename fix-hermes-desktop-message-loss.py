@@ -2,35 +2,40 @@
 """
 fix-hermes-desktop-message-loss.py
 ==================================
-一键修复 Hermes Agent 桌面版的「消息发出后休眠/关机就丢失」问题。
+One-shot fix for the Hermes Agent desktop app's "message sent but gone
+after sleep/shutdown" issue.
 
-问题背景
+Background
+----------
+By default the desktop app only writes a user message to state.db after a
+full turn of ``build_turn_context`` finishes. If the machine sleeps or
+shuts down before that point -- or image analysis fails, or the provider
+hangs -- the message exists only in memory and vanishes on reboot (the UI
+showed it as "sent", but it is gone the next morning).
+
+What this script does:
+1. tui_gateway/server.py -- persist the user message to state.db BEFORE
+   calling ``run_conversation`` (the user's original text is kept, not the
+   image-failure placeholder), and mark it via ``_pending_cli_user_message``
+   + ``_db_persisted`` so the agent's flush skips it -- no duplicate rows.
+2. run_agent.py -- stop silently skipping persistence when ``_session_db``
+   is unavailable; emit an explicit warning so the reason a message was
+   never persisted becomes visible.
+
+Features
 --------
-桌面版 Hermes 的消息默认要等一轮对话的 build_turn_context 走完才写入
-state.db。如果在这之前电脑休眠/关机、图片分析失败、或 provider 卡死，
-用户刚发出去的消息只存在于内存，重启后消失（界面显示"发出去了"，但
-第二天打开就不见了）。
+- Idempotent: safe to re-run; already-patched files are skipped.
+- Auto-locate: supports git installs (~/.hermes/hermes-agent) and pip.
+- Safe: backs up each file before modifying (.bak.<8-hex>); on syntax
+  check failure the change is rolled back.
+- Zero third-party dependencies: Python standard library only.
 
-本脚本做两件事：
-1. tui_gateway/server.py —— 在调用 run_conversation 之前，把用户消息
-   立即写入 state.db（持久化用户原文而非图片占位符），并通过
-   _pending_cli_user_message + _db_persisted 标记让 agent 的 flush 跳过，
-   不产生重复行。
-2. run_agent.py —— 当 _session_db 不可用时不再静默跳过，输出明确警告，
-   让"消息未持久化"的原因可见。
+Usage
+-----
+    python3 fix-hermes-desktop-message-loss.py [Hermes-install-dir]
 
-特性
-----
-- 幂等：重复运行安全，已修复的文件会自动跳过。
-- 自动定位：支持 git 安装 (~/.hermes/hermes-agent) 与 pip 安装。
-- 安全：修改前自动备份 (.bak.时间戳)，语法校验失败不落盘。
-- 无第三方依赖：仅用 Python 标准库。
-
-用法
-----
-    python3 fix-hermes-desktop-message-loss.py [Hermes安装目录]
-
-不带参数时自动探测安装目录。修复后需重启 Hermes 桌面 app 生效。
+With no argument the install dir is auto-detected. Restart the Hermes
+desktop app after running.
 """
 
 import os
@@ -41,19 +46,19 @@ import tempfile
 import uuid
 from pathlib import Path
 
-# ───────────────────────────── 补丁定义 ─────────────────────────────
-# 每个补丁: (文件名, 旧串, 新串, 幂等标记串)
-# 幂等标记串已存在于文件中 → 跳过该补丁
+# ───────────────────────────── Patch definitions ─────────────────────────────
+# Each patch: (filename, old_text, new_text, idempotent_marker)
+# If the marker is already present in the file, the patch is skipped.
 
 PATCH_RUN_AGENT_LOG = (
     "run_agent.py",
-    # old: 静默返回
+    # old: silent return
     """        if getattr(self, "_persist_disabled", False):
             return
         if not self._session_db:
             return
         # Persist user-message override (#48677 chokepoint): historically this""",
-    # new: 加 warning
+    # new: emit a warning
     """        if getattr(self, "_persist_disabled", False):
             return
         if not self._session_db:
@@ -73,20 +78,24 @@ PATCH_RUN_AGENT_LOG = (
 
 PATCH_TUI_CALLSITE = (
     "tui_gateway/server.py",
-    # old: 直接调用 run_conversation
+    # old: direct run_conversation call
     """            result = agent.run_conversation(run_message, **run_kwargs)""",
-    # new: 先立即持久化
-    """            # ── 立即持久化用户消息（防断连/关机/休眠丢失）──────────────
-            # 默认路径下，用户消息要等 build_turn_context 末尾的
-            # _ensure_and_persist 才写库——中间任何一步（系统提示构建、
-            # 预压缩、插件 hook、memory prefetch、图片分析）异常或进程被
-            # 休眠/断电打断，消息就只悬在内存里，重启后消失。这里在调用
-            # run_conversation 之前就把本条用户消息写入 state.db，并通过
-            # _pending_cli_user_message 复用同一 dict（带 _db_persisted
-            # 标记），让 agent 的 _flush_messages_to_session_db 因 marker
-            # 跳过它——既保证立即落盘，又不产生重复行。
-            # persist_user_message 必须与 staged content 一致，turn_context
-            # 才会复用该 dict（见 turn_context.py expected_persist_content）。
+    # new: persist the user message first
+    """            # ── Persist the user message immediately (crash-loss guard) ──
+            # In the default path the user message is only written to
+            # state.db at the end of build_turn_context (its
+            # _ensure_and_persist step). Any failure before that point --
+            # system-prompt build, preflight compression, plugin hooks,
+            # memory prefetch, image analysis -- or a sleep/power cut
+            # mid-turn leaves the message dangling in memory only, gone
+            # after reboot. Write it here, before run_conversation is even
+            # called, and hand the same dict to the turn via
+            # _pending_cli_user_message (with the _db_persisted marker) so
+            # the agent's _flush_messages_to_session_db skips it -- the
+            # message is durable immediately and no duplicate row is made.
+            # persist_user_message must equal the staged content so
+            # turn_context reuses the dict (see expected_persist_content in
+            # turn_context.py).
             _persist_user_message_immediately(session, agent, prompt, run_message)
             staged_content = getattr(agent, "_pending_cli_user_message", None)
             if isinstance(staged_content, dict):
@@ -97,14 +106,14 @@ PATCH_TUI_CALLSITE = (
 
 PATCH_TUI_FUNC = (
     "tui_gateway/server.py",
-    # old: 在第二个 _content_display_text 定义前插入
+    # old: insert before the second _content_display_text definition
     """    return history
 
 
 def _content_display_text(content: Any) -> str:
     if content is None:
         return """,
-    # new: 新函数 + 原定义
+    # new: new function + original definition
     """    return history
 
 
@@ -183,22 +192,22 @@ def _content_display_text(content: Any) -> str:
 PATCHES = [PATCH_RUN_AGENT_LOG, PATCH_TUI_CALLSITE, PATCH_TUI_FUNC]
 
 
-# ───────────────────────────── 工具函数 ─────────────────────────────
+# ───────────────────────────── Helpers ─────────────────────────────
 
 def find_hermes_root(argv):  # -> Optional[Path]
-    """定位 Hermes 安装目录：显式参数 > 环境变量 > 常见路径 > hermes 命令。"""
-    # 1. 命令行参数
+    """Locate the Hermes install dir: explicit arg > common paths > hermes cmd."""
+    # 1. Command-line argument
     for arg in argv[1:]:
         p = Path(arg).expanduser()
         if (p / "run_agent.py").exists():
             return p
-    # 2. 环境变量
+    # 2. Common install locations
     home = Path.home() / ".hermes"
     candidates = [
-        home / "hermes-agent",          # git 安装
-        Path("/opt/hermes-agent"),      # 常见自定义位置
+        home / "hermes-agent",          # git install
+        Path("/opt/hermes-agent"),      # common custom location
     ]
-    # 3. hermes 命令报告安装目录
+    # 3. hermes command reports its install directory
     try:
         out = subprocess.run(
             ["hermes", "--version"], capture_output=True, text=True, timeout=15
@@ -217,16 +226,16 @@ def find_hermes_root(argv):  # -> Optional[Path]
 
 
 def apply_patch(path: Path, old: str, new: str, idempotent_marker: str) -> str:
-    """对单个文件应用一个补丁。返回状态描述。"""
+    """Apply one patch to a single file. Returns a status string."""
     text = path.read_text(encoding="utf-8")
     if idempotent_marker in text:
-        return f"SKIP  已修复（幂等标记存在）"
+        return f"SKIP  already patched (idempotent marker present)"
     if old not in text:
-        return f"SKIP  未匹配旧代码（版本可能不同，跳过）"
+        return f"SKIP  old code not found (version may differ; skipped)"
     backup = path.with_name(path.name + f".bak.{uuid.uuid4().hex[:8]}")
     shutil.copy2(path, backup)
     text = text.replace(old, new, 1)
-    # 语法校验：失败则回滚
+    # Syntax check: roll back on failure
     tmp = Path(tempfile.mktemp(suffix=".py"))
     try:
         tmp.write_text(text, encoding="utf-8")
@@ -235,27 +244,27 @@ def apply_patch(path: Path, old: str, new: str, idempotent_marker: str) -> str:
         py_compile.compile(str(tmp), doraise=True)
     except Exception as exc:
         tmp.unlink(missing_ok=True)
-        return f"FAIL  语法校验失败，已回滚: {exc}"
+        return f"FAIL  syntax check failed, rolled back: {exc}"
     tmp.unlink(missing_ok=True)
     path.write_text(text, encoding="utf-8")
-    return f"OK    已打补丁（备份: {backup.name}）"
+    return f"OK    patched (backup: {backup.name})"
 
 
-# ───────────────────────────── 主流程 ─────────────────────────────
+# ───────────────────────────── Main ─────────────────────────────
 
 def main() -> int:
     root = find_hermes_root(sys.argv)
     if root is None:
-        print("❌ 找不到 Hermes 安装目录。")
-        print("   请手动指定：python3 fix-hermes-desktop-message-loss.py /path/to/hermes-agent")
+        print("❌ Could not locate the Hermes install directory.")
+        print("   Specify it manually: python3 fix-hermes-desktop-message-loss.py /path/to/hermes-agent")
         return 1
 
-    print(f"📂 Hermes 安装目录: {root}")
+    print(f"📂 Hermes install directory: {root}")
     results = []
     for fname, old, new, marker in PATCHES:
         fpath = root / fname
         if not fpath.exists():
-            results.append((fname, "SKIP  文件不存在"))
+            results.append((fname, "SKIP  file not found"))
             continue
         print(f"   {fname} ...")
         results.append((fname, apply_patch(fpath, old, new, marker)))
@@ -271,14 +280,14 @@ def main() -> int:
 
     print("─" * 60)
     if n_fail == 0 and n_ok >= 0:
-        print(f"✅ 完成：{n_ok} 个补丁应用，{n_skip} 个跳过，{n_fail} 个失败。")
+        print(f"✅ Done: {n_ok} patch(es) applied, {n_skip} skipped, {n_fail} failed.")
         if n_ok > 0:
-            print("🚀 请重启 Hermes 桌面 app（完全退出再打开）使修复生效。")
-            print("   验证：重启后发一条消息，然后休眠/关机，重开后消息应仍在。")
+            print("🚀 Restart the Hermes desktop app (fully quit, then reopen) to apply the fix.")
+            print("   Verify: send a message, sleep/shut down, reopen — the message should still be there.")
         else:
-            print("ℹ️  所有补丁均已应用或无需修改，重启即可。")
+            print("ℹ️  All patches already applied or nothing to change; restart to pick it up.")
     else:
-        print(f"⚠️  有 {n_fail} 个补丁失败，请检查输出或手动修复。")
+        print(f"⚠️  {n_fail} patch(es) failed — check the output above or fix manually.")
     return 0 if n_fail == 0 else 2
 
 
