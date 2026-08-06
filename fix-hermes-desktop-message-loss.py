@@ -33,6 +33,7 @@ state.db。如果在这之前电脑休眠/关机、图片分析失败、或 prov
 不带参数时自动探测安装目录。修复后需重启 Hermes 桌面 app 生效。
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -221,7 +222,7 @@ def apply_patch(path: Path, old: str, new: str, idempotent_marker: str) -> str:
         return f"SKIP  已修复（幂等标记存在）"
     if old not in text:
         return f"SKIP  未匹配旧代码（版本可能不同，跳过）"
-    backup = path.with_name(path.name + f".bak.{tempfile.mktemp(suffix='').split('/')[-1]}")
+    backup = path.with_name(path.name + f".bak.{os.path.basename(tempfile.mktemp(suffix=''))}")
     shutil.copy2(path, backup)
     text = text.replace(old, new, 1)
     # 语法校验：失败则回滚
