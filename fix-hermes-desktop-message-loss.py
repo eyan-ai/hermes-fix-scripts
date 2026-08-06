@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 # ───────────────────────────── 补丁定义 ─────────────────────────────
@@ -222,7 +223,7 @@ def apply_patch(path: Path, old: str, new: str, idempotent_marker: str) -> str:
         return f"SKIP  已修复（幂等标记存在）"
     if old not in text:
         return f"SKIP  未匹配旧代码（版本可能不同，跳过）"
-    backup = path.with_name(path.name + f".bak.{os.path.basename(tempfile.mktemp(suffix=''))}")
+    backup = path.with_name(path.name + f".bak.{uuid.uuid4().hex[:8]}")
     shutil.copy2(path, backup)
     text = text.replace(old, new, 1)
     # 语法校验：失败则回滚
